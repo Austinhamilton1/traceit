@@ -1,50 +1,102 @@
-#ifndef MEMRACE_H
-#define MEMRACE_H
+#pragma once
 
-#include <stdint.h>
-#include <pthread.h>
+#include <unordered_map>
+#include <thread>
+#include <atomic>
+#include <mutex>
 
-#define MAX_CLOCK_SIZE 64
-#define TID(epoch) ((uint8_t)((epoch) >> 56))
-#define GET_CLOCK(epoch) ((epoch) & 0x00FFFFFFFFFFFFFFUL)
-#define MAKE_EPOCH(tid, c) ((((uint64_t)(tid)) << 56) | (c))
-#define EMPTY_EPOCH MAKE_EPOCH(0, 1)
-#define READ_SHARED 0
+/* Keeps track of each thread's global time */
+typedef struct {
+    std::mutex mMutex;
+    std::unordered_map<std::thread::id, size_t> vc;
+} vector_clock_t;
 
-struct thread_state {
-    uint8_t tid;                    // Thread ID
-    uint64_t C[MAX_CLOCK_SIZE];     // Thread's local vector clock
-    uint64_t epoch;                 // Cache the current epoch (same as C[tid])
+/* Each memory location has access to one of these */
+struct shadow_mem {
+    std::mutex mMutex;
+    std::thread::id TID;
+    bool was_write;
+    vector_clock_t last_access;
+    size_t race_count;
 };
 
-struct mem_state {
-    pthread_mutex_t lock;           // Used to allow concurrent access to variable metadata
-    uint64_t W;                     // Write epoch
-    uint64_t R;                     // Read epoch
-    uint64_t Rvc[MAX_CLOCK_SIZE];   // Read vector clock (only used on a shared memory read)
-    void *mem;                      // Memory location that the this state refers to
-};
+/* Helper function to determine if two accesses are concurrent or not */
+bool is_concurrent(vector_clock_t& access_1, vector_clock_t& access_2);
 
-struct lock_state {
-    uint64_t L[MAX_CLOCK_SIZE];     // Lock's local vector clock
-    void *mem;                     // Memory location of the lock this state refers to
-};
+/* Determine if a new access is a race on a memory */
+bool is_race(struct shadow_mem& old_state, vector_clock_t& new_clock, bool is_write);
 
-// Detect races on either a read or a write to a variable
-void mem_read(struct mem_state *x, struct thread_state *t);
-void mem_write(struct mem_state *x, struct thread_state *t);
+/* Helper function to get the current thread's vector clock */
+vector_clock_t& get_vector_clock(std::thread::id);
 
-// Update states on synchronizations
-void lock_acq(struct lock_state *l, struct thread_state *t);
-void lock_rel(struct lock_state *l, struct thread_state *t);
+/* Helper function to get/set last acccess state of memory */
+struct shadow_mem& get_shadow_mem(void *mem);
 
-// Updates states on thread creation/joining
-void thread_fork(struct thread_state *t, struct thread_state *u);
-void thread_join(struct thread_state *t, struct thread_state *u);
+/*
+ * Read a memory location.
+ * Arguments:
+ *     T *value - Read from this location.
+ * Returns:
+ *     T - The value in the memory location.
+ */
+template<typename T> T read(T *value) {
+    // Get the shadow memory associated with the memory location
+    void *mem = static_cast<void *>(value);
+    struct shadow_mem& mem_state = get_shadow_mem(mem);
 
-// Initialize states for state types
-void init_thread_state(struct thread_state *t);
-void init_mem_state(struct mem_state *x, void *mem);
-void init_lock_state(struct lock_state *l, pthread_mutex_t *lock);
+    // Grab the current thread clock and lock the structures down
+    vector_clock_t& clock = get_vector_clock(std::this_thread::get_id());
+    mem_state.mMutex.lock();
+    clock.mMutex.lock();
 
-#endif
+    // Update vector clock
+    clock.vc[std::this_thread::get_id()]++;
+
+    // If there is a race, update the race counter
+    if(is_race(mem_state, clock, false))
+        mem_state.race_count++;
+    
+    mem_state.TID = std::this_thread::get_id();
+    mem_state.was_write = false;
+    mem_state.last_access.vc = clock.vc;
+
+    // Unlock the data structures
+    T v = *value;
+    clock.mMutex.unlock();
+    mem_state.mMutex.unlock();
+
+    return v;
+}
+
+/*
+ * Write to a memory location.
+ * Arguments:
+ *     T *dest - Write to this memory location.
+ *     T value - Write this value to the memory.
+ */
+template<typename T> void write(T *dest, T value) {
+    // Get the shadow memory associated with the memory location
+    void *mem = static_cast<void *>(dest);
+    struct shadow_mem& mem_state = get_shadow_mem(mem);
+
+    // Grab the current thread clock and lock the structures down
+    vector_clock_t& clock = get_vector_clock(std::this_thread::get_id());
+    mem_state.mMutex.lock();
+    clock.mMutex.lock();
+
+    // Update vector clock
+    clock.vc[std::this_thread::get_id()]++;
+
+    // If there is a race, update the race counter
+    if(is_race(mem_state, clock, true))
+        mem_state.race_count++;
+
+    mem_state.TID = std::this_thread::get_id();
+    mem_state.was_write = true;
+    mem_state.last_access.vc = clock.vc;
+
+    // Unlock the data structures
+    *dest = value;
+    clock.mMutex.unlock();
+    mem_state.mMutex.unlock();
+}
