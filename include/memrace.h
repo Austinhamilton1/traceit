@@ -24,13 +24,14 @@ struct shadow_mem {
 bool is_concurrent(vector_clock_t& access_1, vector_clock_t& access_2);
 
 /* Determine if a new access is a race on a memory */
-bool is_race(struct shadow_mem& old_state, vector_clock_t& new_clock, bool is_write);
+bool is_race(shadow_mem& old_state, vector_clock_t& new_clock, bool is_write);
 
 /* Helper function to get the current thread's vector clock */
-vector_clock_t& get_vector_clock(std::thread::id);
+vector_clock_t& get_vector_clock();
 
 /* Helper function to get/set last acccess state of memory */
-struct shadow_mem& get_shadow_mem(void *mem);
+shadow_mem& get_shadow_mem(void *mem);
+void mem_init(void *mem);
 
 /*
  * Read a memory location.
@@ -42,10 +43,10 @@ struct shadow_mem& get_shadow_mem(void *mem);
 template<typename T> T read(T *value) {
     // Get the shadow memory associated with the memory location
     void *mem = static_cast<void *>(value);
-    struct shadow_mem& mem_state = get_shadow_mem(mem);
+    shadow_mem& mem_state = get_shadow_mem(mem);
 
     // Grab the current thread clock and lock the structures down
-    vector_clock_t& clock = get_vector_clock(std::this_thread::get_id());
+    vector_clock_t& clock = get_vector_clock();
     mem_state.mMutex.lock();
     clock.mMutex.lock();
 
@@ -60,11 +61,11 @@ template<typename T> T read(T *value) {
     mem_state.was_write = false;
     mem_state.last_access.vc = clock.vc;
 
-    // Unlock the data structures
     T v = *value;
+
+    // Unlock the data structures
     clock.mMutex.unlock();
     mem_state.mMutex.unlock();
-
     return v;
 }
 
@@ -77,10 +78,10 @@ template<typename T> T read(T *value) {
 template<typename T> void write(T *dest, T value) {
     // Get the shadow memory associated with the memory location
     void *mem = static_cast<void *>(dest);
-    struct shadow_mem& mem_state = get_shadow_mem(mem);
+    shadow_mem& mem_state = get_shadow_mem(mem);
 
     // Grab the current thread clock and lock the structures down
-    vector_clock_t& clock = get_vector_clock(std::this_thread::get_id());
+    vector_clock_t& clock = get_vector_clock();
     mem_state.mMutex.lock();
     clock.mMutex.lock();
 
@@ -95,8 +96,9 @@ template<typename T> void write(T *dest, T value) {
     mem_state.was_write = true;
     mem_state.last_access.vc = clock.vc;
 
-    // Unlock the data structures
     *dest = value;
+    
+    // Unlock the data structures
     clock.mMutex.unlock();
     mem_state.mMutex.unlock();
 }
